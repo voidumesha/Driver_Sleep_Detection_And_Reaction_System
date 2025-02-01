@@ -1,132 +1,134 @@
 import cv2
 import numpy as np
 import mediapipe as mp
-import tensorflow as tf
+import dlib
+import pygame
 import time
-import RPi.GPIO as GPIO
 
-# Load Pre-Trained Model
-model = tf.keras.models.load_model("driver_drowsiness_model.h5")
-labels = ['Closed_Eyes', 'Open_Eyes', 'Yawning', 'No_Yawning']
-
-# Initialize Mediapipe Face Mesh
+# Initialize Mediapipe for face landmarks
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(min_detection_confidence=0.7, min_tracking_confidence=0.7)
 
-# Setup GPIO for Buzzer
-BUZZER_PIN = 18
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(BUZZER_PIN, GPIO.OUT)
+# OpenCV pre-trained models for better accuracy
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+mouth_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_smile.xml")
 
-# Open Pi Camera (For USB camera, use `cv2.VideoCapture(0)`)
+# dlib face detector for backup
+detector = dlib.get_frontal_face_detector()
+
+# Initialize pygame for buzzer sound
+pygame.mixer.init()
+pygame.mixer.music.load("buzzer.wav")  # Ensure you have a buzzer.wav file
+
+# Open Camera
 cap = cv2.VideoCapture(0)
 
-closed_eye_start_time = None  # Track eye closure duration
-yawn_start_time = None  # Track yawning duration
+# Timers & Counters
+closed_eye_frame_count = 0
+yawning_timestamps = []
+head_down_count = 0
+fps = 30  # Adjust based on actual FPS
 
+# Frames required for 4 seconds of eye closure
+EYE_CLOSED_THRESHOLD_FRAMES = fps * 4  
+
+# Function to trigger the buzzer
 def buzzer_alert():
-    """ Function to turn on the buzzer for 3 seconds """
-    GPIO.output(BUZZER_PIN, GPIO.HIGH)
-    time.sleep(3)
-    GPIO.output(BUZZER_PIN, GPIO.LOW)
+    pygame.mixer.music.play()
+    print("🚨 [BUZZER] ALERT: Drowsiness Detected! 🚨")
 
+# Function to display LCT alert on screen
+def display_alert(frame, text):
+    cv2.putText(frame, text, (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3, cv2.LINE_AA)
+
+# Start video loop
 while cap.isOpened():
     success, frame = cap.read()
     if not success:
         break
 
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
     results = face_mesh.process(frame_rgb)
 
+    # Face detection (Backup using dlib if needed)
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+    if len(faces) == 0:
+        dlib_faces = detector(gray)
+        if len(dlib_faces) == 0:
+            print("⚠️ No face detected!")
+            closed_eye_frame_count = 0
+            continue
+    
+    # If Mediapipe detects face landmarks, proceed
     if results.multi_face_landmarks:
         for face_landmarks in results.multi_face_landmarks:
-            # Extract eye & mouth landmark coordinates
-            left_eye = [face_landmarks.landmark[i] for i in [33, 133, 160, 158]]  # Left eye key points
-            right_eye = [face_landmarks.landmark[i] for i in [362, 263, 386, 374]]  # Right eye key points
-            mouth = [face_landmarks.landmark[i] for i in [13, 14, 78, 308]]  # Mouth key points
+            # Extract key points for eyes and mouth
+            left_eye_pts = [face_landmarks.landmark[i] for i in [33, 133, 160, 158]]
+            right_eye_pts = [face_landmarks.landmark[i] for i in [362, 263, 386, 374]]
+            mouth_pts = [face_landmarks.landmark[i] for i in [13, 14, 78, 308]]
+            nose_tip = face_landmarks.landmark[1]  # Nose tip for head-down detection
 
             # Convert to pixel coordinates
             def landmark_to_pixel(landmarks, frame_shape):
                 return [(int(p.x * frame_shape[1]), int(p.y * frame_shape[0])) for p in landmarks]
 
-            left_eye_pts = landmark_to_pixel(left_eye, frame.shape)
-            right_eye_pts = landmark_to_pixel(right_eye, frame.shape)
-            mouth_pts = landmark_to_pixel(mouth, frame.shape)
+            left_eye_bbox = landmark_to_pixel(left_eye_pts, frame.shape)
+            right_eye_bbox = landmark_to_pixel(right_eye_pts, frame.shape)
+            mouth_bbox = landmark_to_pixel(mouth_pts, frame.shape)
+            nose_tip_pixel = (int(nose_tip.x * frame.shape[1]), int(nose_tip.y * frame.shape[0]))
 
-            # Define bounding boxes
-            def get_bounding_box(pts, margin=10):
-                x_min = min(p[0] for p in pts) - margin
-                y_min = min(p[1] for p in pts) - margin
-                x_max = max(p[0] for p in pts) + margin
-                y_max = max(p[1] for p in pts) + margin
-                return x_min, y_min, x_max, y_max
+            # Eye closure detection using OpenCV's Haar cascade
+            eyes_closed = False
+            detected_eyes = eye_cascade.detectMultiScale(gray, 1.1, 4)
+            if len(detected_eyes) == 0:
+                eyes_closed = True
+                closed_eye_frame_count += 1
+            else:
+                closed_eye_frame_count = 0
 
-            left_eye_bbox = get_bounding_box(left_eye_pts)
-            right_eye_bbox = get_bounding_box(right_eye_pts)
-            mouth_bbox = get_bounding_box(mouth_pts, margin=20)
+            # If eyes are closed for 4 seconds, trigger alert
+            if closed_eye_frame_count >= EYE_CLOSED_THRESHOLD_FRAMES:
+                display_alert(frame, "🚨 LCT ALERT: DROWSINESS DETECTED!")
+                buzzer_alert()
+                closed_eye_frame_count = 0  # Reset counter
 
-            # Crop the regions from frame
-            def crop_region(frame, bbox):
-                x_min, y_min, x_max, y_max = bbox
-                return frame[max(0, y_min):min(frame.shape[0], y_max), max(0, x_min):min(frame.shape[1], x_max)]
+            # Yawning detection
+            mouth_detected = mouth_cascade.detectMultiScale(gray, 1.5, 15)
+            if len(mouth_detected) > 0:
+                yawning_timestamps.append(time.time())
 
-            left_eye_region = crop_region(frame, left_eye_bbox)
-            right_eye_region = crop_region(frame, right_eye_bbox)
-            mouth_region = crop_region(frame, mouth_bbox)
+                # Remove yawns older than 60 seconds
+                yawning_timestamps = [t for t in yawning_timestamps if time.time() - t < 60]
 
-            # Preprocess Image for CNN Model
-            def preprocess(image):
-                if image.shape[0] == 0 or image.shape[1] == 0:  # Avoid empty images
-                    return None
-                image = cv2.resize(image, (64, 64))
-                image = image / 255.0  # Normalize
-                image = np.expand_dims(image, axis=0)
-                return image
+                if 3 <= len(yawning_timestamps) <= 5:
+                    display_alert(frame, "⚠️ Frequent Yawning Detected!")
 
-            # Predict Eye State
-            left_eye_input = preprocess(left_eye_region)
-            right_eye_input = preprocess(right_eye_region)
-            mouth_input = preprocess(mouth_region)
+            # Critical condition: 3 yawns + eyes closed + head down
+            if eyes_closed and len(yawning_timestamps) >= 3:
+                head_down_count += 1
+            else:
+                head_down_count = 0
 
-            if left_eye_input is not None and right_eye_input is not None:
-                left_eye_prediction = model.predict(left_eye_input)
-                right_eye_prediction = model.predict(right_eye_input)
+            # Head-down detection
+            if nose_tip_pixel[1] > frame.shape[0] * 0.7:  # If nose tip moves too low
+                head_down_count += 1
+            else:
+                head_down_count = 0
 
-                left_eye_label = labels[np.argmax(left_eye_prediction)]
-                right_eye_label = labels[np.argmax(right_eye_prediction)]
+            # Trigger emergency alert if all three conditions are met
+            if head_down_count >= 10:  # 10 consecutive frames (approx. 0.3 sec)
+                display_alert(frame, "🚨 CRITICAL: HEAD DOWN + YAWNING + EYES CLOSED!")
+                buzzer_alert()
+                head_down_count = 0
+                yawning_timestamps = []  # Reset yawn count after alert
 
-                # Check if both eyes are closed
-                if left_eye_label == "Closed_Eyes" and right_eye_label == "Closed_Eyes":
-                    if closed_eye_start_time is None:
-                        closed_eye_start_time = time.time()
-                    elif time.time() - closed_eye_start_time >= 4:  # 4 seconds of closed eyes
-                        print("🚨 Drowsiness Detected! Triggering Buzzer & LCD... 🚨")
-                        buzzer_alert()
-                else:
-                    closed_eye_start_time = None  # Reset if eyes are open
-
-            # Predict Mouth State
-            if mouth_input is not None:
-                mouth_prediction = model.predict(mouth_input)
-                mouth_label = labels[np.argmax(mouth_prediction)]
-
-                if mouth_label == "Yawning":
-                    if yawn_start_time is None:
-                        yawn_start_time = time.time()
-                    elif time.time() - yawn_start_time >= 3:  # 3 seconds of yawning
-                        print("⚠️ Driver is Yawning Continuously! ⚠️")
-                else:
-                    yawn_start_time = None  # Reset if not yawning
-
-            # Draw bounding boxes (Optional for debugging)
-            cv2.rectangle(frame, (left_eye_bbox[0], left_eye_bbox[1]), (left_eye_bbox[2], left_eye_bbox[3]), (255, 0, 0), 2)
-            cv2.rectangle(frame, (right_eye_bbox[0], right_eye_bbox[1]), (right_eye_bbox[2], right_eye_bbox[3]), (255, 0, 0), 2)
-            cv2.rectangle(frame, (mouth_bbox[0], mouth_bbox[1]), (mouth_bbox[2], mouth_bbox[3]), (0, 255, 0), 2)
-
+    # Display Frame
     cv2.imshow("Driver Monitoring", frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 cap.release()
 cv2.destroyAllWindows()
-GPIO.cleanup()
